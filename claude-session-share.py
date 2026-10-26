@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
-"""Copy a Claude Code session under a new session id.
+"""Copy or transfer a Claude Code session to another account.
 
-Works on macOS, Linux and Windows with Python 3.8+. The source session is
-only read. The copy gets its own id, so it can be resumed on its own
-(`claude --resume <new-id>`), placed in another config directory (another
-account), and optionally registered in the Claude desktop app's Code tab.
+Works on macOS, Linux and Windows with Python 3.8+.
+
+copy      Writes a new session with its own id. The source is only read.
+transfer  Moves the session, keeping its id. It disappears from the source
+          account and appears in the target one.
 
 Run without a session id in a terminal to pick one from a list with the
-arrow keys (type to filter, Enter to select, Esc to quit).
+arrow keys (type to filter, Enter to select, Esc to quit). Without --mode,
+the terminal asks whether to copy or transfer.
 
 Examples:
-    copy-claude-session.py
-    copy-claude-session.py <session-id>
-    copy-claude-session.py <session-id> --no-desktop
-    copy-claude-session.py <session-id> --dest-config-dir ~/.claude-work
-    copy-claude-session.py <session-id> --target <account>/<org>
+    claude-session-share.py
+    claude-session-share.py <session-id> --mode transfer
+    claude-session-share.py <session-id> --mode copy --no-desktop
+    claude-session-share.py <session-id> --dest-config-dir ~/.claude-work
+    claude-session-share.py <session-id> --target <account>/<org>
 """
 import argparse
 import contextlib
@@ -47,6 +49,11 @@ AMBIGUITY_WINDOW_SECONDS = 3600
 TITLE_SCAN_LINES = 300
 TITLE_MAX_LINE_BYTES = 2_000_000
 TITLE_MAX_CHARS = 80
+RECENT_WRITE_SECONDS = 10
+MODE_OPTIONS = [
+    ("copy", "Copy", "new session id, the original stays where it is"),
+    ("transfer", "Transfer", "same session id, moved out of the original account"),
+]
 DETAIL_GAP = 2
 MIN_VISIBLE_ROWS = 5
 FRAME_CHROME_ROWS = 4
@@ -419,8 +426,10 @@ def parse_args():
     parser.add_argument("--desktop-dir", type=Path, default=default_desktop_dir(), help="desktop app claude-code-sessions folder")
     parser.add_argument("--target", help="desktop <account>/<org> to register the copy under (auto-detected when omitted)")
     parser.add_argument("--no-desktop", action="store_true", help="copy the CLI session only, skip the desktop sidebar entry")
-    parser.add_argument("--title-suffix", default=" (copy)")
-    parser.add_argument("--dry-run", action="store_true", help="print the plan without writing anything")
+    parser.add_argument("--mode", choices=("copy", "transfer"), help="copy: new id, original stays. transfer: same id, moved out of the original account. Asked when omitted in a terminal")
+    parser.add_argument("--yes", action="store_true", help="skip the confirmation before a transfer")
+    parser.add_argument("--title-suffix", default=" (copy)", help="appended to the title of a copy")
+    parser.add_argument("--dry-run", action="store_true", help="print the plan without changing anything")
     return parser.parse_args()
 
 
@@ -433,6 +442,82 @@ def select_session_id(args, store, source_projects):
     in_current_project = not args.all_projects and (source_projects / current_slug).is_dir()
     sessions = list_sessions(source_projects, store.metadata_by_cli_id(), current_slug if in_current_project else None)
     return choose_session(sessions, show_project=not in_current_project)
+
+
+def choose_mode(args):
+    if args.mode:
+        return args.mode
+    if not is_interactive():
+        return "copy"
+    return pick("What do you want to do?", MODE_OPTIONS) or sys.exit(1)
+
+
+def confirm(question):
+    return input(f"{question} [y/N] ").strip().lower() in ("y", "yes")
+
+
+def run_copy(args, store, transcript, source_meta, cli_id, dest_projects, target_scope):
+    new_id = str(uuid.uuid4())
+    destination_dir = dest_projects / transcript.parent.name
+    destination = destination_dir / f"{new_id}.jsonl"
+    sidecar = transcript.with_suffix("")
+
+    print(f"copy        {destination}")
+    print(f"desktop     {'/'.join(target_scope) if target_scope else 'not registered'}")
+    print(f"new id      {new_id}")
+    if args.dry_run:
+        return
+
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    lines = copy_transcript(transcript, destination, cli_id, new_id)
+    if sidecar.is_dir():
+        shutil.copytree(sidecar, destination_dir / new_id)
+    if target_scope:
+        meta_path = store.root / target_scope[0] / target_scope[1] / f"local_{new_id}.json"
+        meta_path.write_text(json.dumps(build_metadata(source_meta, cli_id, new_id, transcript, args.title_suffix)), encoding="utf-8")
+    print(f"copied {lines} lines")
+    if target_scope:
+        print("restart the Claude desktop app to see it in the sidebar")
+    print(f"resume from the CLI: claude --resume {new_id}")
+
+
+def run_transfer(args, store, transcript, source_meta, cli_id, dest_projects, target_scope):
+    moves_files = dest_projects.resolve() != transcript.parent.parent.resolve()
+    moves_entry = target_scope is not None and source_meta is not None
+    if not (moves_files or moves_entry):
+        fail("nothing to transfer; pass --target <account>/<org> or --dest-config-dir")
+    if moves_entry and store.scope_of(source_meta) == target_scope:
+        fail("the session is already in that account")
+    if time.time() - transcript.stat().st_mtime < RECENT_WRITE_SECONDS:
+        fail("the session was written to a moment ago; close it first, then retry")
+
+    destination_dir = dest_projects / transcript.parent.name
+    sidecar = transcript.with_suffix("")
+    if moves_files and (destination_dir / transcript.name).exists():
+        fail(f"{destination_dir / transcript.name} already exists")
+
+    print(f"transfer    session {cli_id} (same id, removed from the source)")
+    if moves_files:
+        print(f"files       {transcript.parent} -> {destination_dir}")
+    if moves_entry:
+        print(f"desktop     {'/'.join(store.scope_of(source_meta))} -> {'/'.join(target_scope)}")
+    if args.dry_run:
+        return
+    if not args.yes and not (is_interactive() and confirm("Move this session?")):
+        sys.exit("aborted; pass --yes to skip the confirmation")
+
+    if moves_files:
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(transcript), str(destination_dir / transcript.name))
+        if sidecar.is_dir():
+            shutil.move(str(sidecar), str(destination_dir / sidecar.name))
+    if moves_entry:
+        target_dir = store.root / target_scope[0] / target_scope[1]
+        shutil.move(str(source_meta), str(target_dir / source_meta.name))
+    print("transferred")
+    if moves_entry:
+        print("restart the Claude desktop app to see the change in the sidebar")
+    print(f"resume from the CLI: claude --resume {cli_id}")
 
 
 def main():
@@ -453,38 +538,21 @@ def main():
         source_meta = store.find_by_cli_id(cli_id)
 
     transcript = find_transcript(source_projects, cli_id)
-    new_id = str(uuid.uuid4())
-    destination_dir = dest_projects / transcript.parent.name
-    destination = destination_dir / f"{new_id}.jsonl"
-    sidecar = transcript.with_suffix("")
+    mode = choose_mode(args)
 
-    register = not args.no_desktop and store.root.is_dir()
+    register = not args.no_desktop and store.root.is_dir() and (mode == "copy" or source_meta is not None)
     target_scope = None
     if register:
         source_scope = store.scope_of(source_meta) if source_meta else None
         target_scope = store.parse_scope(args.target) if args.target else store.detect_target_scope(source_scope)
     elif args.target:
-        fail("--target needs the desktop folder; check --desktop-dir or drop --no-desktop")
+        fail("--target needs a desktop session and the desktop folder; check --desktop-dir or drop --no-desktop")
 
+    print(f"mode        {mode}")
     print(f"source      {transcript} ({format_size(transcript.stat().st_size)})")
     print(f"source meta {source_meta or 'none'}")
-    print(f"copy        {destination}")
-    print(f"desktop     {'/'.join(target_scope) if target_scope else 'not registered'}")
-    print(f"new id      {new_id}")
-    if args.dry_run:
-        return
-
-    destination_dir.mkdir(parents=True, exist_ok=True)
-    lines = copy_transcript(transcript, destination, cli_id, new_id)
-    if sidecar.is_dir():
-        shutil.copytree(sidecar, destination_dir / new_id)
-    if target_scope:
-        meta_path = store.root / target_scope[0] / target_scope[1] / f"local_{new_id}.json"
-        meta_path.write_text(json.dumps(build_metadata(source_meta, cli_id, new_id, transcript, args.title_suffix)), encoding="utf-8")
-    print(f"copied {lines} lines")
-    if target_scope:
-        print("restart the Claude desktop app to see it in the sidebar")
-    print(f"resume from the CLI: claude --resume {new_id}")
+    run = run_transfer if mode == "transfer" else run_copy
+    run(args, store, transcript, source_meta, cli_id, dest_projects, target_scope)
 
 
 if __name__ == "__main__":
